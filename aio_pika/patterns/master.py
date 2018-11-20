@@ -16,6 +16,20 @@ from .base import Proxy, Base
 log = logging.getLogger(__name__)
 
 
+class MessageProcessingError(Exception):
+    pass
+
+
+class NackMessage(MessageProcessingError):
+    def __init__(self, requeue=False):
+        self.requeue = requeue
+
+
+class RejectMessage(MessageProcessingError):
+    def __init__(self, requeue=False):
+        self.requeue = requeue
+
+
 class Worker:
     __slots__ = 'queue', 'consumer_tag', 'loop',
 
@@ -38,7 +52,6 @@ class Worker:
 class Master(Base):
     __slots__ = 'channel', 'loop', 'proxy',
 
-    CONTENT_TYPE = 'application/python-pickle'
     DELIVERY_MODE = DeliveryMode.PERSISTENT
 
     __doc__ = """
@@ -64,7 +77,12 @@ class Master(Base):
         self.channel = channel          # type: Channel
         self.loop = self.channel.loop   # type: asyncio.AbstractEventLoop
         self.proxy = Proxy(self.create_task)
+
         self.channel.add_on_return_callback(self.on_message_returned)
+
+    @property
+    def exchange(self):
+        return self.channel.default_exchange
 
     def on_message_returned(self, message: ReturnedMessage):
         log.warning(
@@ -101,12 +119,22 @@ class Master(Base):
     async def on_message(self, func, message: IncomingMessage):
         with message.process(requeue=True, ignore_processed=True):
             data = self.deserialize(message.body)
-            await self.execute(func, data)
+
+            try:
+                await self.execute(func, data)
+            except RejectMessage as e:
+                message.reject(requeue=e.requeue)
+            except NackMessage as e:
+                message.nack(requeue=e.requeue)
+
+    async def create_queue(self, channel_name, **kwargs) -> Queue:
+        return await self.channel.declare_queue(channel_name, **kwargs)
 
     async def create_worker(self, channel_name: str,
                             func: Callable, **kwargs) -> Worker:
         """ Creates a new :class:`Worker` instance. """
-        queue = await self.channel.declare_queue(channel_name, **kwargs)
+
+        queue = await self.create_queue(channel_name, **kwargs)
 
         if hasattr(func, "_is_coroutine"):
             fn = func
@@ -132,6 +160,6 @@ class Master(Base):
             **message_kwargs
         )
 
-        await self.channel.default_exchange.publish(
+        await self.exchange.publish(
             message, channel_name, mandatory=True
         )

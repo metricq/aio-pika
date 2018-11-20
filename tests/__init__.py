@@ -1,3 +1,5 @@
+import asyncio
+
 import asynctest
 import logging
 import os
@@ -26,7 +28,32 @@ if not AMQP_URL.path:
 
 
 class AsyncTestCase(asynctest.TestCase):
+    use_default_loop = False
     forbid_get_event_loop = True
+
+    @property
+    def _all_tasks(self):
+        return getattr(asyncio, 'all_tasks', asyncio.Task.all_tasks)
+
+    def _unset_loop(self):
+        policy = asyncio.get_event_loop_policy()
+
+        tasks = list(filter(
+            lambda t: not t.done(),
+            self._all_tasks(self.loop)
+        ))
+
+        for task in tasks:
+            task.cancel()
+
+        if tasks:
+            self.loop.run_until_complete(asyncio.wait(tasks))
+
+        self.loop.close()
+        policy.reset_watcher()
+
+        asyncio.set_event_loop_policy(policy.original_policy)
+        self.loop = None
 
     def get_random_name(self, *args):
         prefix = ['test']
